@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>moomoo 手续费可视化</title>
+  <style>
+    :root {
+      font-family: "Helvetica Neue", Arial, sans-serif;
+      color: #0f172a;
+      background: #f8fafc;
+    }
+    body { margin: 0; padding: 24px; }
+    h1 { margin: 0 0 16px; font-size: 22px; }
+    .card {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 12px;
+      padding: 16px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+      max-width: 1500px;
+      width: 100%;
+    }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    label { display: block; font-size: 12px; color: #475569; margin-bottom: 6px; }
+    input, textarea {
+      width: 100%; box-sizing: border-box;
+      padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 8px;
+      font-size: 14px; outline: none; background: #fff;
+    }
+    input:focus, textarea:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15); }
+    button {
+      padding: 10px 14px; border: none; border-radius: 8px;
+      background: #2563eb; color: #fff; font-size: 14px; cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    #table-wrap { margin-top: 16px; overflow-x: auto; }
+    table { border-collapse: collapse; font-size: 14px; table-layout: auto; width: 100%; max-width: 100%; min-width: 1100px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #e2e8f0; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    .row-del {
+      opacity: 1;
+      background: #fff5f5;
+      border: 1px solid #ef4444;
+      color: #ef4444;
+      font-size: 14px;
+      border-radius: 6px;
+      padding: 4px 8px;
+      cursor: pointer;
+    }
+    td.actions { text-align: center; width: 56px; }
+    .muted { color: #64748b; font-size: 12px; }
+    @media (max-width: 640px) { body { padding: 16px; } }
+  </style>
+</head>
+<body>
+  <h1>moomoo MY 手续费试算</h1>
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label>买入价格 (USD)</label>
+        <input id="buy-price" type="number" step="0.001" value="190.040">
+      </div>
+      <div>
+        <label>卖出价格 (USD)</label>
+        <input id="sell-price" type="number" step="0.001" value="190.040">
+      </div>
+      <div>
+        <label>汇率 (1 MYR → USD)</label>
+        <input id="fx" type="number" step="0.00001" value="0.25346">
+      </div>
+      <div>
+        <label>股数列表（逗号分隔）</label>
+        <input id="qty" type="text" value="1,2,5">
+      </div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+      <button id="calc">计算</button>
+      <span class="muted">口径：逐项计费 → 单项进位/四舍五入到 1 美分 → 求和</span>
+    </div>
+    <div id="table-wrap"></div>
+  </div>
+
+  <script>
+    function round2(x) {
+      return Number((Math.round((x + Number.EPSILON) * 100) / 100).toFixed(2));
+    }
+
+    function calcFees(price, shares, side, fx) {
+      const amount = price * shares;
+      const commission = 0;
+      const platform = 0.99;
+      const clearing = round2(Math.min(shares * 0.003, amount * 0.01));
+      const taf = round2(Math.min(Math.max(shares * 0.000195, 0.01), 9.79));
+      const stampMyr = amount > 0 ? Math.min(Math.floor((amount / fx - 1) / 1000 + 1), 1000) : 0;
+      const stampUsd = round2(stampMyr * fx);
+      const buyFee = round2(commission + platform + clearing + stampUsd);
+      const sellFee = round2(commission + platform + clearing + taf + stampUsd);
+      return side === "BUY" ? buyFee : sellFee;
+    }
+
+    function buildReport(trades, fx, markPx) {
+      let pos = 0;
+      let net = 0;
+      let realized = 0;
+      const rows = [];
+      trades.forEach((t, idx) => {
+        const { date, side, price, shares } = t;
+        const fee = calcFees(price, shares, side, fx);
+        if (side === "BUY") {
+          net = round2(net + price * shares + fee);
+          pos += shares;
+        } else {
+          if (shares > pos) { alert("卖出股数超过持仓"); return; }
+          const avgBefore = pos ? net / pos : 0;
+          const proceeds = price * shares - fee;
+          const pnl = proceeds - avgBefore * shares;
+          realized = round2(realized + pnl);
+          net = round2(net - proceeds);
+          pos -= shares;
+          if (pos === 0) net = 0;
+        }
+        const avgCost = pos ? round2(net / pos) : 0;
+        const currentPx = markPx ?? price;
+        const unrealized = round2((currentPx - avgCost) * pos);
+        rows.push({
+          idx,
+          date: date || "-",
+          side: side === "BUY" ? "买入" : "卖出",
+          price,
+          shares,
+          fee,
+          pos,
+          net,
+          avgCost,
+          realized,
+          unrealized
+        });
+      });
+      return rows;
+    }
+
+    function render(rows) {
+      const header = `
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>动作</th>
+              <th>成交价</th>
+              <th>股数</th>
+              <th>手续费</th>
+              <th>持仓股数</th>
+              <th>净投入(剩余未回本)</th>
+              <th>摊薄每股成本</th>
+              <th>已实现盈亏</th>
+              <th>未实现盈亏</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+      `;
+      const body = rows.map(r => `
+        <tr>
+          <td>${r.date}</td>
+          <td>${r.side}</td>
+          <td>${r.price.toFixed(3)}</td>
+          <td>${r.shares}</td>
+          <td>${r.fee.toFixed(2)}</td>
+          <td>${r.pos}</td>
+          <td>${r.net.toFixed(2)}</td>
+          <td>${r.avgCost.toFixed(2)}</td>
+          <td>${r.realized.toFixed(2)}</td>
+          <td>${r.unrealized.toFixed(2)}</td>
+          <td class="actions"><button class="row-del" data-idx="${r.idx}" title="删除">✕</button></td>
+        </tr>
+      `).join("");
+
+      const addRow = `
+        <tr>
+          <td><input id="in-date" type="date" style="width:100%"></td>
+          <td>
+            <select id="in-side" style="width:100%; padding:8px 10px; border:1px solid #cbd5e1; border-radius:8px;">
+              <option value="BUY">买入</option>
+              <option value="SELL">卖出</option>
+            </select>
+          </td>
+          <td><input id="in-price" type="number" step="0.001" style="width:100%"></td>
+          <td><input id="in-shares" type="number" step="1" style="width:100%"></td>
+          <td colspan="5"></td>
+          <td><button id="add-row" style="width:40px;height:32px;">+</button></td>
+        </tr>
+      `;
+
+      document.getElementById("table-wrap").innerHTML = header + body + addRow + "</tbody></table>";
+
+      document.querySelectorAll(".row-del").forEach(btn => {
+        btn.onclick = () => {
+          const idx = Number(btn.dataset.idx);
+          if (!Number.isInteger(idx)) return;
+          state.trades.splice(idx, 1);
+          refresh();
+        };
+      });
+
+      document.getElementById("add-row").onclick = () => {
+        const date = document.getElementById("in-date").value;
+        const side = document.getElementById("in-side").value;
+        const price = parseFloat(document.getElementById("in-price").value);
+        const shares = parseInt(document.getElementById("in-shares").value, 10);
+        const fx = parseFloat(document.getElementById("fx").value);
+        if (![price, shares, fx].every(Number.isFinite) || shares <= 0 || fx <= 0) {
+          alert("请输入合法的价格、股数、汇率。");
+          return;
+        }
+        state.trades.push({ date, side, price, shares });
+        refresh();
+      };
+    }
+
+    function parseQty(str) {
+      return str.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n > 0);
+    }
+
+    const state = { trades: [], seeded: false };
+
+    function refresh() {
+      const buyPx = parseFloat(document.getElementById("buy-price").value);
+      const sellPx = parseFloat(document.getElementById("sell-price").value);
+      const fx = parseFloat(document.getElementById("fx").value);
+      if (!Number.isFinite(fx) || fx <= 0) { alert("请输入合法汇率"); return; }
+      // 首次加载时用股数列表初始化，之后即使被删光也不再自动补充，允许空表
+      if (!state.seeded) {
+        const qs = parseQty(document.getElementById("qty").value);
+        state.trades = qs.map(q => ({ date: "-", side: "BUY", price: buyPx, shares: q }));
+        state.seeded = true;
+      }
+      const rows = buildReport(state.trades, fx, sellPx);
+      render(rows);
+    }
+
+    document.getElementById("calc").addEventListener("click", () => {
+      state.trades = [];
+      refresh();
+    });
+
+    refresh();
+  </script>
+</body>
+</html>
