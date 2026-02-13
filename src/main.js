@@ -1,0 +1,397 @@
+﻿import './style.css';
+import flatpickr from 'flatpickr';
+import confirmDatePlugin from 'flatpickr/dist/plugins/confirmDate/confirmDate';
+import 'flatpickr/dist/flatpickr.css';
+import 'flatpickr/dist/plugins/confirmDate/confirmDate.css';
+
+document.querySelector('#app').innerHTML = `
+  <h1>美股均薄成本 & 投资回报（含 moomoo 手续费）</h1>
+  <div class="card">
+
+    <div class="grid">
+      <div>
+        <label>标的（可选，仅显示用）</label>
+        <input id="symbol" type="text" placeholder="NVDA" />
+      </div>
+
+      <div>
+        <label>汇率（1 MYR → USD，用于印花税换算）</label>
+        <input id="fx" type="number" step="0.00001" value="0.25346" />
+      </div>
+
+      <div>
+        <label>当前价（用于未实现盈亏，可空；空则用最后一笔成交价）</label>
+        <input id="mark" type="number" step="0.001" placeholder="例如 650.12" />
+      </div>
+
+      <div>
+        <label>手续费口径</label>
+        <div class="muted">逐项计费 → 单项四舍五入到 1 美分 → 求和（与您 Python 版一致）</div>
+      </div>
+    </div>
+
+    <div class="actions-row">
+      <button id="clear">清空交易</button>
+      <button class="ghost" id="export">导出 JSON</button>
+      <button class="ghost" id="import">导入 JSON</button>
+      <span class="muted" id="save-tip">（已自动保存到本地浏览器）</span>
+    </div>
+
+    <div class="summary" id="summary"></div>
+
+    <div id="table-wrap"></div>
+  </div>
+`;
+
+/** -----------------------
+ *  数学/金额工具
+ *  ----------------------- */
+function round2(x){
+  return Number((Math.round((x + Number.EPSILON) * 100) / 100).toFixed(2));
+}
+function fmt(x){
+  if (!Number.isFinite(x)) return "-";
+  const s = (Math.round((x + Number.EPSILON) * 100) / 100).toFixed(2);
+  return s;
+}
+
+/** -----------------------
+ *  moomoo MY 手续费
+ *  ----------------------- */
+function calcFees(price, shares, side, fx){
+  const amount = price * shares;
+  const commission = 0;
+  const platform = 0.99;
+
+  const clearing = round2(Math.min(shares * 0.003, amount * 0.01));
+  const taf = round2(Math.min(Math.max(shares * 0.000195, 0.01), 9.79));
+
+  let stampMyr = 0;
+  if (amount > 0 && Number.isFinite(fx) && fx > 0){
+    const amountMyr = amount / fx;
+    stampMyr = Math.min((Math.floor((amountMyr - 1) / 1000) + 1), 1000);
+    if (!Number.isFinite(stampMyr) || stampMyr < 0) stampMyr = 0;
+  }
+  const stampUsd = round2(stampMyr * fx);
+
+  const buyFee  = round2(commission + platform + clearing + stampUsd);
+  const sellFee = round2(commission + platform + clearing + taf + stampUsd);
+  return side === "BUY" ? buyFee : sellFee;
+}
+
+/** -----------------------
+ *  核心：用“均薄成本(加权平均法)”滚动记账
+ *  ----------------------- */
+function buildReport(trades, fx, markPx){
+  let pos = 0;
+  let netCost = 0;
+  let realized = 0;
+
+  let cashIn = 0;
+  let cashOut = 0;
+  let feeTotal = 0;
+
+  const rows = [];
+  const sorted = [...trades].sort((a,b) => (a.date||"").localeCompare(b.date||""));
+
+  sorted.forEach((t, idx) => {
+    const date = t.date || "-";
+    const side = t.side;
+    const price = Number(t.price);
+    const shares = Number(t.shares);
+
+    const fee = calcFees(price, shares, side, fx);
+
+    feeTotal = round2(feeTotal + fee);
+
+    if (side === "BUY"){
+      const cost = price * shares + fee;
+      cashIn = round2(cashIn + cost);
+
+      netCost = round2(netCost + cost);
+      pos += shares;
+    } else {
+      if (shares > pos){
+        throw new Error(`第 ${idx+1} 笔卖出股数超过持仓（卖 ${shares} > 持 ${pos}）`);
+      }
+      const avgBefore = pos ? (netCost / pos) : 0;
+
+      const proceeds = price * shares - fee;
+      cashOut = round2(cashOut + proceeds);
+
+      const pnl = proceeds - avgBefore * shares;
+      realized = round2(realized + pnl);
+
+      netCost = round2(netCost - proceeds);
+      pos -= shares;
+      if (pos === 0) netCost = 0;
+    }
+
+    const avgCost = pos ? round2(netCost / pos) : 0;
+    const pxForUnreal = Number.isFinite(markPx) ? markPx : price;
+    const unrealized = round2((pxForUnreal - avgCost) * pos);
+
+    rows.push({
+      date,
+      side: side === "BUY" ? "买入" : "卖出",
+      price, shares, fee,
+      pos,
+      netCost,
+      avgCost,
+      realized,
+      unrealized
+    });
+  });
+
+  const lastPx = rows.length ? rows[rows.length - 1].price : NaN;
+  const pxForUnreal2 = Number.isFinite(markPx) ? markPx : lastPx;
+  const avgCostEnd = pos ? round2(netCost / pos) : 0;
+  const marketValue = round2((Number.isFinite(pxForUnreal2) ? pxForUnreal2 : 0) * pos);
+  const unrealizedEnd = round2(marketValue - netCost);
+
+  const totalPnl = round2(cashOut + marketValue - cashIn);
+  const roiTotal = cashIn > 0 ? (totalPnl / cashIn) : NaN;
+
+  const pnlNow = round2(realized + unrealizedEnd);
+  const roiOnCapitalAtWork = netCost > 0 ? (pnlNow / netCost) : NaN;
+
+  return {
+    rows,
+    summary: {
+      pos,
+      avgCostEnd,
+      realized,
+      unrealizedEnd,
+      cashIn,
+      cashOut,
+      netCost,
+      marketValue,
+      totalPnl,
+      roiTotal,
+      roiOnCapitalAtWork,
+      feeTotal,
+      pxForUnreal: pxForUnreal2
+    }
+  };
+}
+
+/** -----------------------
+ *  UI 渲染
+ *  ----------------------- */
+function renderSummary(s, symbol){
+  const el = document.getElementById("summary");
+  const pct = (x) => Number.isFinite(x) ? (x*100).toFixed(2) + "%" : "-";
+
+  el.innerHTML = `
+    <div class="kpi"><div class="k">标的</div><div class="v">${symbol || "-"}</div></div>
+    <div class="kpi"><div class="k">当前持仓</div><div class="v">${s.pos} 股</div></div>
+    <div class="kpi"><div class="k">均薄成本（含费）</div><div class="v">$${fmt(s.avgCostEnd)}</div></div>
+    <div class="kpi"><div class="k">当前价（用于未实现）</div><div class="v">$${fmt(s.pxForUnreal)}</div></div>
+
+    <div class="kpi"><div class="k">已实现盈亏（扣费）</div><div class="v">$${fmt(s.realized)}</div></div>
+    <div class="kpi"><div class="k">未实现盈亏（扣费后口径）</div><div class="v">$${fmt(s.unrealizedEnd)}</div></div>
+    <div class="kpi"><div class="k">总盈亏（已回款+市值-总投入）</div><div class="v">$${fmt(s.totalPnl)}</div></div>
+
+    <div class="kpi"><div class="k">累计手续费</div><div class="v">$${fmt(s.feeTotal)}</div></div>
+
+    <div class="kpi"><div class="k">ROI（口径A：总投入为分母）</div><div class="v">${pct(s.roiTotal)}</div></div>
+    <div class="kpi"><div class="k">ROI（口径B：在场资金为分母）</div><div class="v">${pct(s.roiOnCapitalAtWork)}</div></div>
+
+    <div class="kpi"><div class="k">累计买入现金流出（含费）</div><div class="v">$${fmt(s.cashIn)}</div></div>
+    <div class="kpi"><div class="k">累计卖出净回款（扣费）</div><div class="v">$${fmt(s.cashOut)}</div></div>
+    <div class="kpi"><div class="k">剩余未回本净投入</div><div class="v">$${fmt(s.netCost)}</div></div>
+  `;
+}
+
+let datePicker = null;
+
+function applyDatePicker(){
+  if (datePicker){
+    datePicker.destroy();
+    datePicker = null;
+  }
+  const input = document.getElementById("in-date");
+  if (!input) return;
+  datePicker = flatpickr(input, {
+    dateFormat: "Y-m-d",
+    allowInput: true,
+    defaultDate: input.value || null,
+    plugins: [confirmDatePlugin({
+      showAlways: true,
+      confirmText: "确定",
+      showClear: true,
+      showTodayButton: true
+    })]
+  });
+}
+
+function renderTable(rows){
+  const wrap = document.getElementById("table-wrap");
+
+  const head = `
+    <table>
+      <thead>
+        <tr>
+          <th>日期</th>
+          <th>动作</th>
+          <th>成交价</th>
+          <th>股数</th>
+          <th>手续费</th>
+          <th>持仓股数</th>
+          <th>剩余未回本净投入</th>
+          <th>均薄成本/股</th>
+          <th>已实现盈亏（累计）</th>
+          <th>未实现盈亏（按当前价）</th>
+          <th class="actions">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+
+  const body = rows.map((r, i) => `
+    <tr>
+      <td>${r.date}</td>
+      <td><span class="pill">${r.side}</span></td>
+      <td>${Number(r.price).toFixed(3)}</td>
+      <td>${r.shares}</td>
+      <td>${fmt(r.fee)}</td>
+      <td>${r.pos}</td>
+      <td>${fmt(r.netCost)}</td>
+      <td>${fmt(r.avgCost)}</td>
+      <td>${fmt(r.realized)}</td>
+      <td>${fmt(r.unrealized)}</td>
+      <td class="actions"><button class="row-del" data-i="${i}" title="删除">删</button></td>
+    </tr>
+  `).join("");
+
+  const addRow = `
+    <tr>
+      <td><input id="in-date" type="text" placeholder="选择日期" /></td>
+      <td>
+        <select id="in-side">
+          <option value="BUY">买入</option>
+          <option value="SELL">卖出</option>
+        </select>
+      </td>
+      <td><input id="in-price" type="number" step="0.001" placeholder="190.040" /></td>
+      <td><input id="in-shares" type="number" step="1" placeholder="10" /></td>
+      <td colspan="6"></td>
+      <td class="actions"><button id="add-row" title="添加">+</button></td>
+    </tr>
+  `;
+
+  wrap.innerHTML = head + body + addRow + `</tbody></table>`;
+
+  applyDatePicker();
+
+  // 删除
+  wrap.querySelectorAll(".row-del").forEach(btn => {
+    btn.onclick = () => {
+      const i = Number(btn.dataset.i);
+      if (!Number.isInteger(i)) return;
+      state.trades.splice(i, 1);
+      persist();
+      refresh();
+    };
+  });
+
+  // 添加
+  document.getElementById("add-row").onclick = () => {
+    const date = document.getElementById("in-date").value || "-";
+    const side = document.getElementById("in-side").value;
+    const price = Number(document.getElementById("in-price").value);
+    const shares = Number(document.getElementById("in-shares").value);
+
+    if (![price, shares].every(Number.isFinite) || price <= 0 || shares <= 0){
+      alert("请输入合法的价格与股数。");
+      return;
+    }
+    state.trades.push({ date, side, price, shares });
+    persist();
+    refresh();
+  };
+}
+
+/** -----------------------
+ *  本地存储
+ *  ----------------------- */
+const LS_KEY = "avg_cost_roi_moomoo_v1";
+const state = { trades: [], symbol: "NVDA" };
+
+function persist(){
+  const symbol = document.getElementById("symbol").value || "";
+  state.symbol = symbol;
+  localStorage.setItem(LS_KEY, JSON.stringify({ symbol: state.symbol, trades: state.trades }));
+}
+
+function load(){
+  try{
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw);
+    if (obj && Array.isArray(obj.trades)) state.trades = obj.trades;
+    if (obj && typeof obj.symbol === "string") state.symbol = obj.symbol;
+  }catch(e){}
+}
+
+/** -----------------------
+ *  刷新计算
+ *  ----------------------- */
+function refresh(){
+  const fx = Number(document.getElementById("fx").value);
+  if (!Number.isFinite(fx) || fx <= 0){
+    alert("请输入合法汇率（1 MYR → USD）。");
+    return;
+  }
+  const symbol = document.getElementById("symbol").value || state.symbol || "";
+  const mark = Number(document.getElementById("mark").value);
+  const markPx = Number.isFinite(mark) ? mark : NaN;
+
+  try{
+    const { rows, summary } = buildReport(state.trades, fx, markPx);
+    renderSummary(summary, symbol);
+    renderTable(rows);
+  }catch(err){
+    alert(err.message || String(err));
+  }
+}
+
+document.getElementById("symbol").addEventListener("input", () => { persist(); refresh(); });
+document.getElementById("fx").addEventListener("input", refresh);
+document.getElementById("mark").addEventListener("input", refresh);
+
+document.getElementById("clear").onclick = () => {
+  if (!confirm("确定清空所有交易吗？")) return;
+  state.trades = [];
+  persist();
+  refresh();
+};
+
+document.getElementById("export").onclick = () => {
+  const payload = JSON.stringify({ symbol: document.getElementById("symbol").value || "", trades: state.trades }, null, 2);
+  navigator.clipboard.writeText(payload).then(() => alert("已复制到剪贴板。"));
+};
+
+document.getElementById("import").onclick = () => {
+  const raw = prompt("粘贴导入 JSON（格式：{ symbol, trades:[{date,side,price,shares}] } ）");
+  if (!raw) return;
+  try{
+    const obj = JSON.parse(raw);
+    if (!obj || !Array.isArray(obj.trades)) throw new Error("JSON 格式不对：缺少 trades 数组。");
+    state.trades = obj.trades;
+    document.getElementById("symbol").value = (obj.symbol || "");
+    persist();
+    refresh();
+  }catch(e){
+    alert("导入失败：" + (e.message || e));
+  }
+};
+
+// init
+load();
+document.getElementById("symbol").value = state.symbol || "";
+refresh();
+
+
+
+
